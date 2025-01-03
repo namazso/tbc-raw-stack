@@ -37,7 +37,7 @@ struct Args {
     output_basename: String,
 
     /// How many fields to process (0 = all)
-    #[arg(short='c', long, default_value_t = 0)]
+    #[arg(short = 'c', long, default_value_t = 0)]
     max_fields: usize,
 
     /// How many inputs should agree on having a dropout to mark it as such [default: ceil(inputs_count / 2)]
@@ -157,6 +157,10 @@ fn main() {
         );
     }
 
+    if args.input_basename.len() != args.start_field.len() {
+        panic!("Count of input parameters and start field parameters is not equal!");
+    }
+
     let mut inputs = args
         .input_basename
         .iter()
@@ -197,7 +201,7 @@ fn main() {
             }
         })
         .collect::<Vec<_>>();
-    
+
     if inputs[0].dupe_count != 0 {
         panic!("The first input must have correct field order!")
     }
