@@ -61,7 +61,7 @@ struct InputTbc {
     index: usize,
     metadata: TbcMetadata,
     tbc: BufReader<File>,
-    chroma: BufReader<File>,
+    chroma: Option<BufReader<File>>,
     field_index: usize,
     dupe_count: usize,
     last_seq_no: usize,
@@ -114,9 +114,9 @@ impl SystemConstants {
 
 const SYSTEM_PAL: SystemConstants = SystemConstants {
     black_start_sample: 24048,
-    black_end_sample: 24928,    // 24 935 originally but we pick a nicer number
+    black_end_sample: 24928, // 24 935 originally but we pick a nicer number
     useful_start_sample: 61312, // line 55
-    useful_end_sample: 258752,  // line 229
+    useful_end_sample: 258752, // line 229
     psnr_scale: 0.7 * (0xD300 - 0x0100) as f32,
 };
 
@@ -204,13 +204,18 @@ fn main() {
             tbc_file
                 .seek(SeekFrom::Start((field_bytes * start_field) as u64))
                 .expect("Cannot seek to start field");
-            let chroma_file = File::open(chroma).expect("Cannot open chroma file");
-            let mut chroma_file =
-                BufReader::with_capacity(field_size * IO_BUFFER_MULTIPLIER, chroma_file);
-            chroma_file
-                .seek(SeekFrom::Start((field_bytes * start_field) as u64))
-                .expect("Cannot seek to start field");
-
+            let chroma_file = match File::open(chroma) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                v => Some({
+                    let chroma_file = v.expect("Cannot open chroma file");
+                    let mut chroma_file =
+                        BufReader::with_capacity(field_size * IO_BUFFER_MULTIPLIER, chroma_file);
+                    chroma_file
+                        .seek(SeekFrom::Start((field_bytes * start_field) as u64))
+                        .expect("Cannot seek to start field");
+                    chroma_file
+                }),
+            };
             InputTbc {
                 index: i,
                 metadata,
@@ -234,6 +239,8 @@ fn main() {
         &SYSTEM_NTSC
     };
 
+    let have_chroma = inputs[0].chroma.is_some();
+
     let dropout_threshold = args.dropout_threshold.unwrap_or(inputs.len().div_ceil(2));
 
     let field_width = inputs[0].metadata.video_parameters.field_width;
@@ -248,10 +255,15 @@ fn main() {
         let file = File::create_new(path).expect("Cannot create tbc file");
         BufWriter::with_capacity(field_size * IO_BUFFER_MULTIPLIER, file)
     };
-    let mut out_chroma = {
+    let mut out_chroma = if have_chroma {
         let path = args.output_basename.clone() + "_chroma.tbc";
         let file = File::create_new(path).expect("Cannot create tbc file");
-        BufWriter::with_capacity(field_size * IO_BUFFER_MULTIPLIER, file)
+        Some(BufWriter::with_capacity(
+            field_size * IO_BUFFER_MULTIPLIER,
+            file,
+        ))
+    } else {
+        None
     };
     let mut out_fields: Vec<tbc_metadata::Field> = Vec::new();
     let mut out_metrics = args.metrics_csv.map(|f| {
@@ -321,7 +333,9 @@ fn main() {
                 f.dupe_count += 1;
                 f.field_index += 1;
                 f.tbc.seek_relative((field_size * 2) as i64).unwrap();
-                f.chroma.seek_relative((field_size * 2) as i64).unwrap();
+                if let Some(chroma) = f.chroma.as_mut() {
+                    chroma.seek_relative((field_size * 2) as i64).unwrap();
+                }
             }
         }
 
@@ -365,10 +379,11 @@ fn main() {
                     .tbc
                     .read_exact(unsafe { to_bytes_mut(&mut in_luma[i][0..field_size]) })
                     .unwrap();
-                inputs[i]
-                    .chroma
-                    .read_exact(unsafe { to_bytes_mut(&mut in_chroma[i][0..field_size]) })
-                    .unwrap();
+                if let Some(chroma) = inputs[i].chroma.as_mut() {
+                    chroma
+                        .read_exact(unsafe { to_bytes_mut(&mut in_chroma[i][0..field_size]) })
+                        .unwrap();
+                }
             }
 
             // We calculate median luma in 3 parts, because we only want the SSE of the middle bits.
@@ -401,15 +416,17 @@ fn main() {
                 &mut sse_luma_edge[..],
             );
 
-            median::batch_n(
-                new_chroma,
-                in_chroma
-                    .iter()
-                    .map(|f| &(**f)[0..field_size_rounded])
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-                &mut sse_chroma[..],
-            );
+            if have_chroma {
+                median::batch_n(
+                    new_chroma,
+                    in_chroma
+                        .iter()
+                        .map(|f| &(**f)[0..field_size_rounded])
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    &mut sse_chroma[..],
+                );
+            }
 
             new_field.vits_metrics = Some(VitsMetrics {
                 bpsnr: calculate_bpsnr(&new_luma[0..field_size], sys) as f64,
@@ -527,9 +544,11 @@ fn main() {
         out_luma
             .write_all(unsafe { to_bytes(&new_luma[0..field_size]) })
             .unwrap();
-        out_chroma
-            .write_all(unsafe { to_bytes(&new_chroma[0..field_size]) })
-            .unwrap();
+        if let Some(out_chroma) = out_chroma.as_mut() {
+            out_chroma
+                .write_all(unsafe { to_bytes(&new_chroma[0..field_size]) })
+                .unwrap();
+        }
         out_fields.push(new_field.clone());
     }
 
