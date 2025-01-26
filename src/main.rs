@@ -52,7 +52,7 @@ struct Args {
     #[arg(long)]
     fieldmap_csv: Option<PathBuf>,
 
-    /// If provided, write MSE
+    /// If provided, write RMSE pSNR
     #[arg(long)]
     metrics_csv: Option<PathBuf>,
 }
@@ -82,33 +82,54 @@ const MAX_SAMPLES_PER_FIELD: usize = 0x57000;
 const MIN_INPUT_STREAMS: usize = 3;
 const MAX_INPUT_STREAMS: usize = 15;
 
-const MSE_WARN_THRESHOLD: usize = 30;
+const RMSE_WARN_THRESHOLD: usize = 30;
 
-// 355255 PAL samples * 512 * 2 channels = ~347 MB per input
+// 355 255 PAL samples * 512 * 2 channels = ~347 MB per input
 // 347 MB * (15 input + 1 output) = 5.552 GB total memory usage
-// since 512 is also default sector size, it may help with storage stuff too...
+// since 512 is also the default sector size, it may help with storage stuff too...
 const IO_BUFFER_MULTIPLIER: usize = 512;
 
-struct BpsnrConstants {
-    start_sample: usize,
-    end_sample: usize,
-    scale: f32,
+struct SystemConstants {
+    /// Start sample for calculating black pSNR
+    black_start_sample: usize,
+
+    /// End sample for calculating black pSNR
+    black_end_sample: usize,
+
+    /// Start sample for calculating RMSE pSNR
+    useful_start_sample: usize,
+
+    /// End sample for calculating RMSE pSNR
+    useful_end_sample: usize,
+
+    /// Difference between black and white
+    psnr_scale: f32,
 }
 
-const BPSNR_PAL: BpsnrConstants = BpsnrConstants {
-    start_sample: 24048,
-    end_sample: 24928, // 24935 originally but we pick a nicer number
-    scale: 0.7 * (0xD300 - 0x0100) as f32,
+impl SystemConstants {
+    fn error_to_psnr(&self, error: f32) -> f32 {
+        20. * (self.psnr_scale / error).log10()
+    }
+}
+
+const SYSTEM_PAL: SystemConstants = SystemConstants {
+    black_start_sample: 24048,
+    black_end_sample: 24928,    // 24 935 originally but we pick a nicer number
+    useful_start_sample: 61312, // line 55
+    useful_end_sample: 258752,  // line 229
+    psnr_scale: 0.7 * (0xD300 - 0x0100) as f32,
 };
 
-const BPSNR_NTSC: BpsnrConstants = BpsnrConstants {
-    start_sample: 144, // 143 originally
-    end_sample: 432,   // 429 originally
-    scale: 0.75 * (0xC800 - 0x0400) as f32,
+const SYSTEM_NTSC: SystemConstants = SystemConstants {
+    black_start_sample: 144,    // 143 originally
+    black_end_sample: 432,      // 429 originally
+    useful_start_sample: 27328, // line 31
+    useful_end_sample: 209280,  // line 231
+    psnr_scale: 0.75 * (0xC800 - 0x0400) as f32,
 };
 
-fn calculate_bpsnr(field: &[u16], constants: &BpsnrConstants) -> f32 {
-    let region = &field[constants.start_sample..constants.end_sample];
+fn calculate_bpsnr(field: &[u16], constants: &SystemConstants) -> f32 {
+    let region = &field[constants.black_start_sample..constants.black_end_sample];
     let len = region.len();
     assert_eq!(len % 16, 0);
     let mut sum = 0u32;
@@ -128,7 +149,7 @@ fn calculate_bpsnr(field: &[u16], constants: &BpsnrConstants) -> f32 {
         }
     }
     let stddev = (variance / len as f32).sqrt();
-    20. * (constants.scale / stddev).log10()
+    constants.error_to_psnr(stddev)
 }
 
 #[repr(align(64))]
@@ -207,6 +228,11 @@ fn main() {
     }
 
     let system = inputs[0].metadata.video_parameters.system.clone();
+    let sys = if system == System::Pal {
+        &SYSTEM_PAL
+    } else {
+        &SYSTEM_NTSC
+    };
 
     let dropout_threshold = args.dropout_threshold.unwrap_or(inputs.len().div_ceil(2));
 
@@ -254,8 +280,9 @@ fn main() {
         .collect::<Vec<_>>();
 
     let mut sse_luma = vec![0u64; inputs.len()];
+    let mut sse_luma_edge = vec![0u64; inputs.len()];
     let mut sse_chroma = vec![0u64; inputs.len()];
-    let mut mse_bad_in_a_row = vec![0usize; inputs.len()];
+    let mut rmse_bad_in_a_row = vec![0usize; inputs.len()];
 
     let now = Instant::now();
 
@@ -344,15 +371,36 @@ fn main() {
                     .unwrap();
             }
 
+            // We calculate median luma in 3 parts, because we only want the SSE of the middle bits.
+            // The rest may be garbage due to head switch, and we don't want it to skew the numbers.
             median::batch_n(
-                new_luma,
+                &mut new_luma[0..sys.useful_start_sample],
                 in_luma
                     .iter()
-                    .map(|f| &(**f)[0..field_size_rounded])
+                    .map(|f| &(**f)[0..sys.useful_start_sample])
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                &mut sse_luma_edge[..],
+            );
+            median::batch_n(
+                &mut new_luma[sys.useful_start_sample..sys.useful_end_sample],
+                in_luma
+                    .iter()
+                    .map(|f| &(**f)[sys.useful_start_sample..sys.useful_end_sample])
                     .collect::<Vec<_>>()
                     .as_slice(),
                 &mut sse_luma[..],
             );
+            median::batch_n(
+                &mut new_luma[sys.useful_end_sample..field_size_rounded],
+                in_luma
+                    .iter()
+                    .map(|f| &(**f)[sys.useful_end_sample..field_size_rounded])
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                &mut sse_luma_edge[..],
+            );
+
             median::batch_n(
                 new_chroma,
                 in_chroma
@@ -364,14 +412,7 @@ fn main() {
             );
 
             new_field.vits_metrics = Some(VitsMetrics {
-                bpsnr: calculate_bpsnr(
-                    &new_luma[0..field_size],
-                    if system == System::Pal {
-                        &BPSNR_PAL
-                    } else {
-                        &BPSNR_NTSC
-                    },
-                ) as f64,
+                bpsnr: calculate_bpsnr(&new_luma[0..field_size], sys) as f64,
                 other: Default::default(),
             });
 
@@ -447,37 +488,38 @@ fn main() {
         }
 
         {
-            let mse = sse_luma
+            let useful_size = sys.useful_end_sample - sys.useful_start_sample;
+            let rmse_psnr = sse_luma
                 .iter()
-                .map(|f| f / field_size as u64)
+                .map(|f| sys.error_to_psnr((*f as f32 / useful_size as f32).sqrt()))
                 .collect::<Vec<_>>();
 
-            let str = mse
+            let str = rmse_psnr
                 .iter()
                 .map(|v| format!("{}", v))
                 .collect::<Vec<_>>()
                 .join(",");
-            trace!("MSE: {}", str);
+            trace!("RMSE pSNR: {}", str);
             if let Some(metrics) = out_metrics.as_mut() {
                 metrics
                     .write_all(format!("{},{}\n", new_field_idx + 1, str).as_bytes())
                     .unwrap();
             }
-            let sum = mse.iter().sum::<u64>();
-            for (i, &v) in mse.iter().enumerate() {
-                let avg_of_others = (sum - v) / (inputs.len() as u64 - 1);
-                if v > 2500000 && v > avg_of_others * 2 {
-                    mse_bad_in_a_row[i] += 1;
-                    if mse_bad_in_a_row[i] % MSE_WARN_THRESHOLD == 0 {
+            let sum = rmse_psnr.iter().sum::<f32>();
+            for (i, &v) in rmse_psnr.iter().enumerate() {
+                let avg_of_others = (sum - v) / ((inputs.len() - 1) as f32);
+                if v < 32. && v < avg_of_others - 5. {
+                    rmse_bad_in_a_row[i] += 1;
+                    if rmse_bad_in_a_row[i] % RMSE_WARN_THRESHOLD == 0 {
                         warn!(
-                        "MSE on input #{} has been very high for {} fields: {}. Bad source or desync?",
+                        "RMSE pSNR on input #{} has been very high for {} fields: {}. Bad source or desync?",
                         i + 1,
-                            mse_bad_in_a_row[i],
+                            rmse_bad_in_a_row[i],
                         v
                     );
                     }
                 } else {
-                    mse_bad_in_a_row[i] = 0;
+                    rmse_bad_in_a_row[i] = 0;
                 }
             }
         }
