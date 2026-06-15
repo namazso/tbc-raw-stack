@@ -1,0 +1,15 @@
+[package]
+name = "tbc-raw-stack"
+description = "Median filter for raw TBC files"
+version = "0.2.0"
+edition = "2021"
+license = "MPL-2"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+median = { path = "../median" }
+serde = "1"
+serde_derive = "1"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

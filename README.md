@@ -6,6 +6,18 @@ A median filter for TBCs that don't have VBI frame numbers, such as outputs of v
 
 **tbc-raw-stack** is a tool for applying median filter to "raw" TBC sources, such as tape captures via **vhs-decode**. Median filter (aka "stacking") can be used to combine multiple captures of the same media (possibly from a different physical copy) to improve quality and reduce dropouts. It is similar to **ld-disc-stacker** however that tool relies on frame indices extracted from the VBI area of LaserDiscs, while **tbc-raw-stack** relies on the user to line up the starting points, then on heuristics to detect desyncs.
 
+## Building
+
+Build for the microarchitecture level you intend to run on:
+
+```text
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release   # SSE4.1 (128-bit)
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release   # AVX2   (256-bit)
+RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --release   # AVX-512BW
+```
+
+You can also use `-C target-cpu=native` to build for the machine you are compiling on.
+
 ## Usage
 
 ### 1. Capture multiple copies

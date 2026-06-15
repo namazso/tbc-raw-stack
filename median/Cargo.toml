@@ -1,0 +1,9 @@
+[package]
+name = "median"
+description = "Auto-vectorized SIMD median filter"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2"
+
+[dependencies]
+paste = "1"

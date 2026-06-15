@@ -1,17 +1,6 @@
-[package]
-name = "tbc-raw-stack"
-description = "Median filter for raw TBC files"
-version = "0.2.0"
-edition = "2021"
-license = "MPL-2"
-
-[dependencies]
-clap = { version = "4", features = ["derive"] }
-serde = "1"
-serde_derive = "1"
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+[workspace]
+members = ["tbc-raw-stack", "median"]
+resolver = "2"
 
 [profile.release]
 lto = true
